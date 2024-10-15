@@ -1,0 +1,567 @@
+---
+title: "Gender_Gap_TED"
+author: "Aanchal Setia"
+date: "2024-09-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Load necessary libraries
+p_load(readr)       
+p_load(dplyr)       
+p_load(MASS)       
+p_load(sjPlot)
+p_load(stm)         
+p_load(quanteda)
+p_load(scales)
+p_load(ggplot2)    
+p_load(tidyr)      
+p_load(ggpubr)      
+p_load(purrr)      
+p_load(corrplot)   
+p_load(interactions)
+p_load(wordcloud)
+```
+
+## Reading, Cleaning & Merging Datasets 
+
+```{r}
+# Reading the main dataset containing TED Talk transcripts
+Ted <- read_csv("~/Documents/TEDTALK/Ted.csv")
+
+# Reading the file with gender annotations (manual coding of speaker gender)
+Coding <- read_csv("~/Documents/TEDTALK/TEDTalks_URA_Annotations - URA TEDTalks Annotation.csv")
+
+```
+Checking and Manipulating Date Variables
+```{r}
+# Checking the class of the variable 'published_timestamp' to confirm it’s in date format
+class(Ted$published_timestamp)
+
+# Extracting the year from the 'published_timestamp' and saving it in a new variable 'year'
+Ted$year <- format(Ted$published_timestamp, "%Y")
+
+```
+Subsetting Columns of Interest
+```{r}
+# Subsetting columns of interest from the 'Ted' dataset (specific columns: 2, 3, 4, 6, 7, 62, 63, 203)
+Ted <- Ted[, c(2, 3, 4, 6, 7, 62, 63, 85, 203)]
+```
+Merging Data and Recoding Gender
+```{r}
+# Merging the 'Coding' and 'Culture' datasets based on 'talk__id' (unique identifier for each TED Talk)
+# The 'all = TRUE' ensures all rows are retained in the merge, even if no match is found in either dataset
+merged_data <- merge(Coding, Ted, by = "talk__id", all = TRUE)
+
+# Recoding gender values to standardize the labels (e.g., 'F' becomes 'Female', 'males' becomes 'Male', etc.)
+merged_data$recode_gender <- dplyr::recode(merged_data$speaker_gender, 
+                                     "F" = "Female",
+                                     "males" = "Male",
+                                     "M" = "Male",
+                                     "male" = "Male",
+                                     "woman" = "Female",
+                                     "female" = "Female",
+                                     "nonbinary" = "non-binary")
+# Keeping only rows where gender is either 'Male' or 'Female' (excluding non-binary and missing data)
+merged_data <- subset(merged_data, merged_data$recode_gender == "Male" | merged_data$recode_gender == "Female")
+
+# Displaying a frequency table of the recoded gender variable
+table(merged_data$recode_gender)
+##Removing Rows with Missing Values
+
+# Removing rows where the 'transcript' column has missing values (NA)
+merged_data <- merged_data[!is.na(merged_data$transcript), ]
+
+# Removing rows where the 'like_count' column has missing values (NA)
+merged_data <- merged_data[!is.na(merged_data$like_count), ]
+
+
+
+# Reading the results from the transcript (which generated tags for the TED Talks)
+ted <- read_csv("~/Downloads/results.csv")
+
+# Removing rows where 'talks__tags' column has missing values (NA)
+ted <- ted[!is.na(ted$talks__tags), ]
+
+# Subsetting columns to keep only 'talk__id' and 'talks__tags' 
+ted <- ted[,c(3,6)]
+
+# Merging the 'merged_data' with the ted data based on 'talk__id' (the unique identifier for TED Talks)
+ted <- merge(merged_data, ted, by = 'talk__id')
+
+# Removing rows where 'talks__tags' is missing (NA)
+ted <- ted[!is.na(ted$talks__tags),]
+```
+Preparing Document Feature Matrix (DFM)
+```{r}
+# Create a Document Feature Matrix (DFM) using tokenized TED Talk tags
+myDfm <- dfm(tokens_remove(
+
+    tokens(ted$talks__tags, remove_punct = TRUE),
+
+    stopwords("en")
+
+  ),
+
+  tolower = TRUE
+
+)
+```
+Choosing Optimal Number of Topics (K)
+```{r}
+# Perform a search for optimal K (number of topics) using the searchK function.
+# K values are tested between 3 and 30 topics, with a sample size of 1000 documents.
+differentKs <- searchK(myDfm,     
+                       K = c(3:30),
+                       N = 1000,
+                       data = ted$talks__tags,
+                       max.em.its = 1000,
+                       init.type = "Spectral")
+```
+Visualizing Model Fit Metrics
+```{r}
+# Convert the results into a tidy format for visualization
+
+plot_data <- differentKs$results %>%
+  pivot_longer(cols = -K, names_to = "metric", values_to = "value") %>%
+  filter(metric %in% c("lbound", "heldout", "residual", "semcoh")) %>%
+  mutate(value = map_dbl(value, ~ .[1])) %>%
+  mutate(K = map_dbl(K, ~ .[1]))
+
+# Plot the model fit metrics (log likelihood, held-out likelihood, residuals, etc.) for different values of K
+ggplot(plot_data, aes(x = K, y = value, color = metric)) +
+  geom_point() +
+  geom_line() +
+  geom_vline(xintercept = c(18, 20, 23, 30), linetype = "solid", color = "black") +
+  scale_x_continuous(breaks = c(18, 20, 23, 30)) +
+  facet_wrap(~metric, scales = "free") +
+  labs(x = "Number of Topics (K)", y = "Metric Value") +
+  theme_pubr() +
+  theme(legend.position = "bottom", legend.title = element_blank())
+```
+
+Running the STM Model with K = 20
+```{r}
+# Selecting the number of topics (K = 20) based on the visualized metrics
+tag_topic_20 <- stm(myDfm, K = 20,
+                    verbose = FALSE, seed = 1234, init.type = "Spectral")
+
+# Displaying the summary of the STM model
+summary(tag_topic_20)
+
+```
+
+Estimating the Effect of Gender on Topic Prevalence
+```{r}
+# Estimate the effect of gender on topic prevalence using the estimateEffect function
+# This models the prevalence of each topic (1 to 20) as a function of speaker gender
+mes20 <- estimateEffect(formula = 1:20 ~ recode_gender,
+                        stmobj = tag_topic_20,
+                        metadata =ted)
+
+# Displaying the summary of the estimated effects
+summary(mes20)
+```
+Calculating and Plotting Average Topic Probabilities
+```{r}
+# Extract the document-topic proportions (theta matrix) and convert it to a data frame
+doc_topic_p20 <- as.data.frame(tag_topic_20$theta)
+
+# Combine the document-topic probabilities with the original dataset 
+ted20 <- cbind(ted, doc_topic_p20)
+
+# Converting gender and year to factor and numeric variables for further analysis
+ted20$recode_gender <- as.factor(ted20$recode_gender)
+ted20$year <- as.numeric(ted20$year)
+
+# Renaming the gender variable for clarity
+ted20 <- ted20 %>%
+  rename(Gender = recode_gender)
+
+#Identifying the Dominant Topic for Each Document
+
+# Finding the dominant topic for each document (i.e., the topic with the highest probability for each document)
+ted20$dominant_topic <- apply(ted20[, 22:41], 1, which.max)
+
+#Calculating and Plotting Average Topic Probabilities
+# Calculate the average topic probability for documents with each dominant topic
+avg_probs <- ted20 %>%
+  group_by(dominant_topic) %>%
+  summarise(across(V1:V20, mean, na.rm = TRUE))
+
+# Optionally, calculate the average probability for all topics across all documents
+avg_probs_all <- ted20 %>%
+  summarise(across(V1:V20, mean, na.rm = TRUE))
+
+# Reshape the average probabilities data for visualization
+avg_probs_long <- avg_probs %>%
+  pivot_longer(cols = V1:V20, names_to = "Topic", values_to = "Average_Probability") %>%
+  mutate(Type = "Dominant Topic")
+
+avg_probs_all_long <- avg_probs_all %>%
+  pivot_longer(cols = V1:V20, names_to = "Topic", values_to = "Average_Probability") %>%
+  mutate(Type = "All Topics")
+
+# Combine both datasets (dominant vs all topics) for plotting
+plot_data <- bind_rows(avg_probs_long, avg_probs_all_long)
+
+# Plot the average topic probabilities
+ggplot(plot_data, aes(x = Topic, y = Average_Probability, fill = Type)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 1) +
+  labs(title = "Average Topic Probabilities: Dominant vs All Topics",
+       x = "Topic",
+       y = "Average Probability") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+Creating a Correlation Matrix for Topics
+```{r}
+# Creating a correlation matrix for the topic proportions (V1 to V20)
+correlation_matrix <- cor(ted20[, paste0("V", 1:20)], use = "pairwise.complete.obs")
+
+# Plotting the correlation matrix with significance levels
+corrplot(correlation_matrix, method = "circle", type = "upper", sig.level = 0.05, tl.col = "black", tl.srt = 45)
+
+```
+
+Word Clouds
+
+```{r}
+#This code generates word clouds for seven topics identified by the STM model, using the cloud() function and a custom color palette. Topics like AI & Robotics, Cognitive Science, Social Justice, Personal Growth, Gender & Sexuality, Mental Health, and Culture are represented. Each word cloud includes up to 12 high-frequency words (except Culture, which has 50), providing a visual representation of the terms most closely associated with each topic.
+
+# Word Clouds
+
+# Define your color palette
+my_colors <- c("#003366", "#004d00", "#b30000", "#0033cc", "#990000")
+
+# Create the word cloud with proper scaling for term frequencies
+AIRobotics <- cloud(tag_topic_20, topic = 20, type = "model", max.words = 12, colors = my_colors)
+CogSci <- cloud(tag_topic_20, topic = 6, type = "model", max.words = 12, colors = my_colors)
+SocialJustice <- cloud(tag_topic_20, topic = 10, type = "model", max.words = 12, colors = my_colors)
+PersonalGrowth <- cloud(tag_topic_20, topic = 12, type = "model", max.words = 12, colors = my_colors)
+GenderSexuality <- cloud(tag_topic_20, topic = 14, type = "model", max.words = 12, colors = my_colors)
+MentalHealth <- cloud(tag_topic_20, topic = 15, type = "model", max.words = 12, colors = my_colors)
+Culture <- cloud(tag_topic_20, topic = 17, type = "model", max.words = 50, colors = my_colors)
+
+```
+
+Statistical Analyses
+
+```{r}
+#This code performs statistical analyses for various TED Talk topics (AI & Robotics, Cognitive Science, Social Justice & Activism, Personal Growth, Gender & Sexuality, Mental Health, and Culture). Generalized linear models (negative binomial regressions) are fitted to examine the interaction of year and gender on the number of likes received, with duration as a control variable. Interaction plots are generated for each topic, with gender represented by red (female) and blue (male), and confidence intervals included.
+
+
+
+# Statistical Analyses
+
+# AI Related Topic
+AIandRobotics <- subset(ted20, ted20$dominant_topic == '5')
+AIandRobotics <- glm.nb(like_count ~ year * Gender + duration + fame_google , data = AIandRobotics)
+summary(AIandRobotics)
+plot_AI <- interact_plot(AIandRobotics, 
+                         pred = year, 
+                         modx = Gender,  
+                         plot.points = FALSE,
+                         interval = TRUE,           
+                         colors = c("red", "blue"))
+
+final_plot_AI <- plot_AI + labs(x = "Year",                
+               y = "Number of Likes",     
+               color = "Gender") +        
+  scale_color_manual(labels = c("Female", "Male"), values = c("red", "blue")) + 
+  scale_fill_manual(values = c("red", "blue")) +  
+  scale_y_continuous(labels = label_number(scale = 1, big.mark = ",")) + 
+  theme(legend.position = "right")
+print(final_plot_AI)
+# Cognitive Science
+Cognitive_Science <- subset(ted20, ted20$dominant_topic == '6')
+Cognitive_Science <- glm.nb(like_count ~ year * Gender + duration + fame_google, data = Cognitive_Science)
+summary(Cognitive_Science)
+plot_CogSci <- interact_plot(Cognitive_Science, 
+                             pred = year, 
+                             modx = Gender,  
+                             plot.points = FALSE,
+                             interval = TRUE,           
+                             colors = c("red", "blue"))
+
+final_plot_Cog <- plot_CogSci + labs(x = "Year",                
+                   y = "Number of Likes",     
+                   color = "Gender") +        
+  scale_color_manual(labels = c("Female", "Male"), values = c("red", "blue")) + 
+  scale_fill_manual(values = c("red", "blue")) +  
+  scale_y_continuous(labels = label_number(scale = 1, big.mark = ",")) + 
+  theme(legend.position = "right")
+print(final_plot_Cog)
+# Social Justice & Activism
+Social_Justice <- subset(ted20, ted20$dominant_topic == '10')
+Social_Justice <- glm.nb(like_count ~ year * Gender + fame_google, data = Social_Justice)
+summary(Social_Justice)
+plot_Social_Justice <- interact_plot(Social_Justice, 
+                                     pred = year, 
+                                     modx = Gender,  
+                                     plot.points = FALSE,
+                                     interval = TRUE,           
+                                     colors = c("red", "blue"))
+
+final_plot_SJ <- plot_Social_Justice + labs(x = "Year",                
+                           y = "Number of Likes",     
+                           color = "Gender") +        
+  scale_color_manual(labels = c("Female", "Male"), values = c("red", "blue")) + 
+  scale_fill_manual(values = c("red", "blue")) +  
+  scale_y_continuous(labels = label_number(scale = 1, big.mark = ",")) + 
+  theme(legend.position = "right")
+print(final_plot_SJ)
+# Personal Growth
+Personal_Growth <- subset(ted20, ted20$dominant_topic == '12')
+Personal_Growth <- glm.nb(like_count ~ year * Gender + duration + fame_google, data = Personal_Growth)
+summary(Personal_Growth)
+plot_Personal_Growth <- interact_plot(Personal_Growth, 
+                                      pred = year, 
+                                      modx = Gender,  
+                                      plot.points = FALSE,
+                                      interval = TRUE,           
+                                      colors = c("red", "blue"))
+
+final_plot_PG <- plot_Personal_Growth + labs(x = "Year",                
+                            y = "Number of Likes",     
+                            color = "Gender") +        
+  scale_color_manual(labels = c("Female", "Male"), values = c("red", "blue")) + 
+  scale_fill_manual(values = c("red", "blue")) +  
+  scale_y_continuous(labels = label_number(scale = 1, big.mark = ",")) + 
+  theme(legend.position = "right")
+print(final_plot_PG)
+# Gender & Sexuality
+Gender_Sexuality <- subset(ted20, ted20$dominant_topic == '14')
+Gender_Sexuality <- glm.nb(like_count ~ year * Gender + duration + fame_google, data = Gender_Sexuality)
+summary(Gender_Sexuality)
+plot_Gender_Sexuality <- interact_plot(Gender_Sexuality, 
+                                       pred = year, 
+                                       modx = Gender,  
+                                       plot.points = FALSE,
+                                       interval = TRUE,           
+                                       colors = c("red", "blue"))
+
+final_plot_GS <- plot_Gender_Sexuality + labs(x = "Year",                
+                             y = "Number of Likes",     
+                             color = "Gender") +        
+  scale_color_manual(labels = c("Female", "Male"), values = c("red", "blue")) + 
+  scale_fill_manual(values = c("red", "blue")) +  
+  scale_y_continuous(labels = label_number(scale = 1, big.mark = ",")) + 
+  theme(legend.position = "right")
+print(final_plot_GS)
+# Mental Health
+Mental_Health <- subset(ted20, ted20$dominant_topic == '15')
+Mental_Health <- glm.nb(like_count ~ year * Gender + duration + fame_google, data = Mental_Health)
+summary(Mental_Health)
+plot_Mental_Health <- interact_plot(Mental_Health, 
+                                    pred = year, 
+                                    modx = Gender,  
+                                    plot.points = FALSE,
+                                    interval = TRUE,           
+                                    colors = c("red", "blue"))
+
+final_plot_MH <- plot_Mental_Health + labs(x = "Year",                
+                          y = "Number of Likes",     
+                          color = "Gender") +        
+  scale_color_manual(labels = c("Female", "Male"), values = c("red", "blue")) + 
+  scale_fill_manual(values = c("red", "blue")) +  
+  scale_y_continuous(labels = label_number(scale = 1, big.mark = ",")) + 
+  theme(legend.position = "right")
+print(final_plot_MH)
+
+# Culture
+Culture <- subset(ted20, ted20$dominant_topic == '17')
+Culture <- glm.nb(like_count ~ year * Gender + duration + fame_google, data = Culture)
+summary(Culture)
+plot_Culture <- interact_plot(Culture, 
+                              pred = year, 
+                              modx = Gender,  
+                              plot.points = FALSE,
+                              interval = TRUE,           
+                              colors = c("red", "blue"))
+
+final_plot_C <- plot_Culture + labs(x = "Year",                
+                    y = "Number of Likes",     
+                    color = "Gender") +        
+  scale_color_manual(labels = c("Female", "Male"), values = c("red", "blue")) + 
+  scale_fill_manual(values = c("red", "blue")) +  
+  scale_y_continuous(labels = label_number(scale = 1, big.mark = ",")) + 
+  theme(legend.position = "right")
+print(final_plot_C)
+
+
+##Robustness Checks 
+#This is an example model that controls for speaker's fame as well as number of male and female speakers in all talks per topic.
+
+speaker_counts <- ted20 %>%
+  group_by(year, Gender) %>%
+  summarise(count = n(), .groups = 'drop')
+
+# Reshape the data to have separate columns for male and female counts
+speaker_counts_wide <- speaker_counts %>%
+  pivot_wider(names_from = Gender, values_from = count, values_fill = 0)
+
+# Rename columns for easier reference
+colnames(speaker_counts_wide) <- c("year", "female_count", "male_count")
+
+# Join this back to your original dataset
+data <- left_join(ted20, speaker_counts_wide, by = "year")
+
+dom_topic1 <- subset(data, data$dominant_topic == '5')
+model <- glm.nb(like_count ~ Gender * year +  female_count + male_count + duration +fame_google, data = dom_topic1)
+summary(model)
+plot_AI <- interact_plot(model, 
+                         pred = year, 
+                         modx = Gender,  
+                         plot.points = FALSE,
+                         interval = TRUE,           
+                         colors = c("red", "blue"))
+plot_AI + labs(x = "Year",                
+               y = "Number of Likes",     
+               color = "Gender") +        
+  scale_color_manual(labels = c("Female", "Male"), values = c("red", "blue")) + 
+  scale_fill_manual(values = c("red", "blue")) +  
+  scale_y_continuous(labels = label_number(scale = 1, big.mark = ",")) + 
+  theme(legend.position = "right")
+```
+```{r}
+
+#View Count
+
+# AI Related Topic
+AIandRobotics <- subset(ted20, ted20$dominant_topic == '5')
+AIandRobotics <- glm.nb(view_count ~ year * Gender + duration, data = AIandRobotics)
+summary(AIandRobotics)
+plot_AI <- interact_plot(AIandRobotics, 
+                         pred = year, 
+                         modx = Gender,  
+                         plot.points = FALSE,
+                         interval = TRUE,           
+                         colors = c("red", "blue"))
+
+plot_AI + labs(x = "Year",                
+               y = "Number of Likes",     
+               color = "Gender") +        
+  scale_color_manual(labels = c("Female", "Male"), values = c("red", "blue")) + 
+  scale_fill_manual(values = c("red", "blue")) +  
+  scale_y_continuous(labels = label_number(scale = 1, big.mark = ",")) + 
+  theme(legend.position = "right")
+
+# Cognitive Science
+Cognitive_Science <- subset(ted20, ted20$dominant_topic == '6')
+Cognitive_Science <- glm.nb(like_count ~ year * Gender + duration, data = Cognitive_Science)
+summary(Cognitive_Science)
+plot_CogSci <- interact_plot(Cognitive_Science, 
+                             pred = year, 
+                             modx = Gender,  
+                             plot.points = FALSE,
+                             interval = TRUE,           
+                             colors = c("red", "blue"))
+
+plot_CogSci + labs(x = "Year",                
+                   y = "Number of Likes",     
+                   color = "Gender") +        
+  scale_color_manual(labels = c("Female", "Male"), values = c("red", "blue")) + 
+  scale_fill_manual(values = c("red", "blue")) +  
+  scale_y_continuous(labels = label_number(scale = 1, big.mark = ",")) + 
+  theme(legend.position = "right")
+
+# Social Justice & Activism
+Social_Justice <- subset(ted20, ted20$dominant_topic == '10')
+Social_Justice <- glm.nb(like_count ~ year * Gender + duration, data = Social_Justice)
+summary(Social_Justice)
+plot_Social_Justice <- interact_plot(Social_Justice, 
+                                     pred = year, 
+                                     modx = Gender,  
+                                     plot.points = FALSE,
+                                     interval = TRUE,           
+                                     colors = c("red", "blue"))
+
+plot_Social_Justice + labs(x = "Year",                
+                           y = "Number of Likes",     
+                           color = "Gender") +        
+  scale_color_manual(labels = c("Female", "Male"), values = c("red", "blue")) + 
+  scale_fill_manual(values = c("red", "blue")) +  
+  scale_y_continuous(labels = label_number(scale = 1, big.mark = ",")) + 
+  theme(legend.position = "right")
+
+# Personal Growth
+Personal_Growth <- subset(ted20, ted20$dominant_topic == '12')
+Personal_Growth <- glm.nb(like_count ~ year * Gender + duration, data = Personal_Growth)
+summary(Personal_Growth)
+plot_Personal_Growth <- interact_plot(Personal_Growth, 
+                                      pred = year, 
+                                      modx = Gender,  
+                                      plot.points = FALSE,
+                                      interval = TRUE,           
+                                      colors = c("red", "blue"))
+
+plot_Personal_Growth + labs(x = "Year",                
+                            y = "Number of Likes",     
+                            color = "Gender") +        
+  scale_color_manual(labels = c("Female", "Male"), values = c("red", "blue")) + 
+  scale_fill_manual(values = c("red", "blue")) +  
+  scale_y_continuous(labels = label_number(scale = 1, big.mark = ",")) + 
+  theme(legend.position = "right")
+
+# Gender & Sexuality
+Gender_Sexuality <- subset(ted20, ted20$dominant_topic == '14')
+Gender_Sexuality <- glm.nb(like_count ~ year * Gender + duration, data = Gender_Sexuality)
+summary(Gender_Sexuality)
+plot_Gender_Sexuality <- interact_plot(Gender_Sexuality, 
+                                       pred = year, 
+                                       modx = Gender,  
+                                       plot.points = FALSE,
+                                       interval = TRUE,           
+                                       colors = c("red", "blue"))
+
+plot_Gender_Sexuality + labs(x = "Year",                
+                             y = "Number of Likes",     
+                             color = "Gender") +        
+  scale_color_manual(labels = c("Female", "Male"), values = c("red", "blue")) + 
+  scale_fill_manual(values = c("red", "blue")) +  
+  scale_y_continuous(labels = label_number(scale = 1, big.mark = ",")) + 
+  theme(legend.position = "right")
+
+# Mental Health
+Mental_Health <- subset(ted20, ted20$dominant_topic == '15')
+Mental_Health <- glm.nb(like_count ~ year * Gender + duration, data = Mental_Health)
+summary(Mental_Health)
+plot_Mental_Health <- interact_plot(Mental_Health, 
+                                    pred = year, 
+                                    modx = Gender,  
+                                    plot.points = FALSE,
+                                    interval = TRUE,           
+                                    colors = c("red", "blue"))
+
+plot_Mental_Health + labs(x = "Year",                
+                          y = "Number of Likes",     
+                          color = "Gender") +        
+  scale_color_manual(labels = c("Female", "Male"), values = c("red", "blue")) + 
+  scale_fill_manual(values = c("red", "blue")) +  
+  scale_y_continuous(labels = label_number(scale = 1, big.mark = ",")) + 
+  theme(legend.position = "right")
+
+# Culture
+Culture <- subset(ted20, ted20$dominant_topic == '17')
+Culture <- glm.nb(like_count ~ year * Gender + duration, data = Culture)
+summary(Culture)
+plot_Culture <- interact_plot(Culture, 
+                              pred = year, 
+                              modx = Gender,  
+                              plot.points = FALSE,
+                              interval = TRUE,           
+                              colors = c("red", "blue"))
+
+plot_Culture + labs(x = "Year",                
+                    y = "Number of Likes",     
+                    color = "Gender") +        
+  scale_color_manual(labels = c("Female", "Male"), values = c("red", "blue")) + 
+  scale_fill_manual(values = c("red", "blue")) +  
+  scale_y_continuous(labels = label_number(scale = 1, big.mark = ",")) + 
+  theme(legend.position = "right")
+
+
+```
